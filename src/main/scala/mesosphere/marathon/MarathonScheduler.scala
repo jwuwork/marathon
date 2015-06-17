@@ -95,6 +95,8 @@ class MarathonScheduler @Inject() (
   //scalastyle:off cyclomatic.complexity method.length
   override def statusUpdate(driver: SchedulerDriver, status: TaskStatus): Unit = {
 
+    status.getData
+
     log.info("Received status update for task %s: %s (%s)"
       .format(status.getTaskId.getValue, status.getState, status.getMessage))
 

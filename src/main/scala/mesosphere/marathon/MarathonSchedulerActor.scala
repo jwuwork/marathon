@@ -3,15 +3,16 @@ package mesosphere.marathon
 import java.util.concurrent.TimeoutException
 
 import akka.actor._
-import akka.event.EventStream
+import akka.event.{ LoggingReceive, EventStream }
 import akka.pattern.ask
 import mesosphere.marathon.MarathonSchedulerActor.ScaleApp
 import mesosphere.marathon.api.LeaderInfo
-import mesosphere.marathon.api.v2.AppUpdate
+import mesosphere.marathon.api.v2.json.V2AppUpdate
+import mesosphere.marathon.core.launchqueue.LaunchQueue
 import mesosphere.marathon.event.{ AppTerminatedEvent, DeploymentFailed, DeploymentSuccess, LocalLeadershipEvent }
 import mesosphere.marathon.health.HealthCheckManager
 import mesosphere.marathon.state._
-import mesosphere.marathon.tasks.{ TaskQueue, TaskTracker }
+import mesosphere.marathon.tasks.TaskTracker
 import mesosphere.marathon.upgrade.DeploymentManager._
 import mesosphere.marathon.upgrade.{ DeploymentManager, DeploymentPlan, TaskKillActor }
 import mesosphere.mesos.protos
@@ -36,7 +37,7 @@ class MarathonSchedulerActor private (
     deploymentRepository: DeploymentRepository,
     healthCheckManager: HealthCheckManager,
     taskTracker: TaskTracker,
-    taskQueue: TaskQueue,
+    taskQueue: LaunchQueue,
     marathonSchedulerDriverHolder: MarathonSchedulerDriverHolder,
     leaderInfo: LeaderInfo,
     eventBus: EventStream,
@@ -63,7 +64,7 @@ class MarathonSchedulerActor private (
 
   def receive: Receive = suspended
 
-  def suspended: Receive = {
+  def suspended: Receive = LoggingReceive.withLabel("suspended"){
     case LocalLeadershipEvent.ElectedAsLeader =>
       log.info("Starting scheduler actor")
       deploymentRepository.all() onComplete {
@@ -90,7 +91,7 @@ class MarathonSchedulerActor private (
 
   //TODO: fix style issue and enable this scalastyle check
   //scalastyle:off cyclomatic.complexity method.length
-  def started: Receive = sharedHandlers orElse {
+  def started: Receive = LoggingReceive.withLabel("started")(sharedHandlers orElse {
     case LocalLeadershipEvent.Standby =>
       log.info("Suspending scheduler actor")
       healthCheckManager.removeAll()
@@ -118,7 +119,7 @@ class MarathonSchedulerActor private (
           res.sendAnswer(origSender, cmd)
 
         res andThen {
-          case _ => self ! cmd.answer
+          case _ => self ! cmd.answer // unlock app
         }
       }
 
@@ -128,35 +129,24 @@ class MarathonSchedulerActor private (
     case cmd @ Deploy(plan, force) =>
       deploy(sender(), cmd)
 
-    case cmd @ KillTasks(appId, taskIds, scale) =>
+    case cmd @ KillTasks(appId, taskIds) =>
       val origSender = sender()
       withLockFor(appId) {
         val promise = Promise[Unit]()
         val tasksToKill = taskIds.flatMap(taskTracker.fetchTask(appId, _))
         context.actorOf(Props(classOf[TaskKillActor], driver, appId, taskTracker, eventBus, tasksToKill, promise))
-        val res = if (scale) {
-          for {
-            _ <- promise.future
-            currentApp <- appRepository.currentVersion(appId)
-            _ <- currentApp
-              .map { app => appRepository.store(app.copy(instances = app.instances - tasksToKill.size)) }
-              .getOrElse(Future.successful(()))
-          } yield ()
-        }
-        else {
-          for {
-            _ <- promise.future
-            Some(app) <- appRepository.currentVersion(appId)
-          } yield schedulerActions.scale(driver, app)
-        }
+        val res = for {
+          _ <- promise.future
+          Some(app) <- appRepository.currentVersion(appId)
+        } yield schedulerActions.scale(driver, app)
 
         res onComplete { _ =>
-          self ! cmd.answer
+          self ! cmd.answer // unlock app
         }
 
         res.sendAnswer(origSender, cmd)
       }
-  }
+  })
 
   /**
     * handlers for messages that unlock apps and to retrieve running deployments
@@ -293,14 +283,14 @@ class MarathonSchedulerActor private (
 
   def deploymentSuccess(plan: DeploymentPlan): Unit = {
     log.info(s"Deployment of ${plan.target.id} successful")
-    eventBus.publish(DeploymentSuccess(plan.id))
+    eventBus.publish(DeploymentSuccess(plan.id, plan))
     deploymentRepository.expunge(plan.id)
   }
 
   def deploymentFailed(plan: DeploymentPlan, reason: Throwable): Unit = {
     log.error(reason, s"Deployment of ${plan.target.id} failed")
     plan.affectedApplicationIds.foreach(appId => taskQueue.purge(appId))
-    eventBus.publish(DeploymentFailed(plan.id))
+    eventBus.publish(DeploymentFailed(plan.id, plan))
     if (reason.isInstanceOf[DeploymentCanceledException])
       deploymentRepository.expunge(plan.id)
   }
@@ -315,7 +305,7 @@ object MarathonSchedulerActor {
     deploymentRepository: DeploymentRepository,
     healthCheckManager: HealthCheckManager,
     taskTracker: TaskTracker,
-    taskQueue: TaskQueue,
+    taskQueue: LaunchQueue,
     marathonSchedulerDriverHolder: MarathonSchedulerDriverHolder,
     leaderInfo: LeaderInfo,
     eventBus: EventStream,
@@ -357,7 +347,7 @@ object MarathonSchedulerActor {
     def answer: Event = DeploymentStarted(plan)
   }
 
-  case class KillTasks(appId: PathId, taskIds: Set[String], scale: Boolean) extends Command {
+  case class KillTasks(appId: PathId, taskIds: Set[String]) extends Command {
     def answer: Event = TasksKilled(appId, taskIds)
   }
 
@@ -392,9 +382,10 @@ object MarathonSchedulerActor {
 
 class SchedulerActions(
     appRepository: AppRepository,
+    groupRepository: GroupRepository,
     healthCheckManager: HealthCheckManager,
     taskTracker: TaskTracker,
-    taskQueue: TaskQueue,
+    taskQueue: LaunchQueue,
     eventBus: EventStream,
     val schedulerActor: ActorRef,
     config: MarathonConf)(implicit ec: ExecutionContext) {
@@ -429,7 +420,7 @@ class SchedulerActions(
       }
       taskQueue.purge(app.id)
       taskTracker.shutdown(app.id)
-      taskQueue.rateLimiter.resetDelay(app)
+      taskQueue.resetDelay(app)
       // TODO after all tasks have been killed we should remove the app from taskTracker
 
       eventBus.publish(AppTerminatedEvent(app.id))
@@ -459,10 +450,7 @@ class SchedulerActions(
           taskTracker.get(appId).collect {
             case task: Protos.MarathonTask if task.hasStatus => task.getStatus
             case task: Protos.MarathonTask => // staged tasks, which have no status yet
-              TaskStatus.newBuilder
-                .setState(TaskState.TASK_STAGING)
-                .setTaskId(TaskID.newBuilder.setValue(task.getId))
-                .build()
+              taskStatus(task)
           }
         }
 
@@ -491,11 +479,22 @@ class SchedulerActions(
     }.map(_ => ())
   }
 
-  def reconcileHealthChecks(): Unit =
+  private def taskStatus(task: Protos.MarathonTask) = {
+    val taskStatusBuilder = TaskStatus.newBuilder
+      .setState(TaskState.TASK_STAGING)
+      .setTaskId(TaskID.newBuilder.setValue(task.getId))
+    if (task.hasSlaveId) {
+      taskStatusBuilder.setSlaveId(task.getSlaveId)
+    }
+    taskStatusBuilder.build()
+  }
+
+  def reconcileHealthChecks(): Unit = {
     for {
-      apps <- appRepository.apps()
+      apps <- groupRepository.rootGroup().map(_.map(_.transitiveApps).getOrElse(Set.empty))
       app <- apps
     } healthCheckManager.reconcileWith(app.id)
+  }
 
   /**
     * Ensures current application parameters (resource requirements, URLs,
@@ -505,7 +504,7 @@ class SchedulerActions(
   private def update(
     driver: SchedulerDriver,
     updatedApp: AppDefinition,
-    appUpdate: AppUpdate): Unit = {
+    appUpdate: V2AppUpdate): Unit = {
     // TODO: implement app instance restart logic
   }
 
@@ -519,15 +518,15 @@ class SchedulerActions(
     if (targetCount > currentCount) {
       log.info(s"Need to scale ${app.id} from $currentCount up to $targetCount instances")
 
-      val queuedCount = taskQueue.count(app.id)
-      val toQueue = targetCount - (currentCount + queuedCount)
+      val queuedOrRunning = taskQueue.get(app.id).map(_.totalTaskCount).getOrElse(currentCount)
+      val toQueue = targetCount - queuedOrRunning
 
       if (toQueue > 0) {
-        log.info(s"Queueing $toQueue new tasks for ${app.id} ($queuedCount queued)")
+        log.info(s"Queueing $toQueue new tasks for ${app.id} ($queuedOrRunning queued or running)")
         taskQueue.add(app, toQueue)
       }
       else {
-        log.info(s"Already queued $queuedCount tasks for ${app.id}. Not scaling.")
+        log.info(s"Already queued or started $queuedOrRunning tasks for ${app.id}. Not scaling.")
       }
     }
     else if (targetCount < currentCount) {
@@ -549,25 +548,6 @@ class SchedulerActions(
     currentAppVersion(appId).map {
       case Some(app) => scale(driver, app)
       case _         => log.warn(s"App $appId does not exist. Not scaling.")
-    }
-  }
-
-  def updateApp(
-    driver: SchedulerDriver,
-    id: PathId,
-    appUpdate: AppUpdate): Future[AppDefinition] = {
-    appRepository.currentVersion(id).flatMap {
-      case Some(currentVersion) =>
-        val updatedApp = appUpdate(currentVersion)
-
-        taskQueue.purge(id)
-
-        appRepository.store(updatedApp).map { _ =>
-          update(driver, updatedApp, appUpdate)
-          healthCheckManager.reconcileWith(id)
-          updatedApp
-        }
-      case _ => throw new UnknownAppException(id)
     }
   }
 

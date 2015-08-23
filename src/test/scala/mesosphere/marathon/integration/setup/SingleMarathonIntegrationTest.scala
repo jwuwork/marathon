@@ -2,6 +2,7 @@ package mesosphere.marathon.integration.setup
 
 import java.io.File
 
+import mesosphere.marathon.api.v2.json.V2AppDefinition
 import mesosphere.marathon.health.HealthCheck
 import mesosphere.marathon.state.{ AppDefinition, PathId }
 import org.apache.commons.io.FileUtils
@@ -46,9 +47,11 @@ trait SingleMarathonIntegrationTest
   val testBasePath: PathId = PathId("/marathonintegrationtest")
   override lazy val marathon: MarathonFacade = new MarathonFacade(config.marathonUrl, testBasePath)
 
+  def extraMarathonParameters: List[String] = List.empty[String]
+
   lazy val marathonProxy = {
-    startMarathon(config.marathonPort + 1, "--master", config.master, "--event_subscriber", "http_callback")
-    new MarathonFacade(config.copy(marathonPort = config.marathonPort + 1).marathonUrl, testBasePath)
+    startMarathon(config.marathonBasePort + 1, "--master", config.master, "--event_subscriber", "http_callback")
+    new MarathonFacade(config.copy(marathonBasePort = config.marathonBasePort + 1).marathonUrl, testBasePath)
   }
 
   implicit class PathIdTestHelper(path: String) {
@@ -68,7 +71,13 @@ trait SingleMarathonIntegrationTest
       ProcessKeeper.startMesosLocal()
       cleanMarathonState()
 
-      startMarathon(config.marathonPort, "--master", config.master, "--event_subscriber", "http_callback")
+      val parameters = List(
+        "--master", config.master,
+        "--event_subscriber", "http_callback",
+        "--access_control_allow_origin", "*"
+      ) ++ extraMarathonParameters
+      startMarathon(config.marathonBasePort, parameters: _*)
+
       log.info("Setting up local mesos/marathon infrastructure: done.")
     }
     else {
@@ -122,7 +131,7 @@ trait SingleMarathonIntegrationTest
     val javaExecutable = sys.props.get("java.home").fold("java")(_ + "/bin/java")
     val classPath = sys.props.getOrElse("java.class.path", "target/classes").replaceAll(" ", "")
     val main = classOf[AppMock].getName
-    s"""$javaExecutable -classpath $classPath $main"""
+    s"""$javaExecutable -Xmx64m -classpath $classPath $main"""
   }
 
   /**
@@ -141,7 +150,10 @@ trait SingleMarathonIntegrationTest
     file.getAbsolutePath
   }
 
-  def appProxy(appId: PathId, versionId: String, instances: Int, withHealth: Boolean = true, dependencies: Set[PathId] = Set.empty): AppDefinition = {
+  def v2AppProxy(appId: PathId, versionId: String, instances: Int, withHealth: Boolean = true, dependencies: Set[PathId] = Set.empty): V2AppDefinition =
+    V2AppDefinition(appProxy(appId, versionId, instances, withHealth, dependencies))
+
+  private[this] def appProxy(appId: PathId, versionId: String, instances: Int, withHealth: Boolean, dependencies: Set[PathId]): AppDefinition = {
     val mainInvocation = appProxyMainInvocation
     val exec = Some(s"""$mainInvocation $appId $versionId http://localhost:${config.httpPort}/health$appId/$versionId""")
     val health = if (withHealth) Set(HealthCheck(gracePeriod = 20.second, interval = 1.second, maxConsecutiveFailures = 10)) else Set.empty[HealthCheck]

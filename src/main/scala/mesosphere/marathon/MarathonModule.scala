@@ -15,9 +15,10 @@ import com.google.inject._
 import com.google.inject.name.Names
 import com.twitter.common.base.Supplier
 import com.twitter.common.zookeeper.{ Candidate, CandidateImpl, Group => ZGroup, ZooKeeperClient }
-import com.twitter.zk.{ NativeConnector, ZkClient }
+import com.twitter.zk.{ AuthInfo, NativeConnector, ZkClient }
 import mesosphere.chaos.http.HttpConf
 import mesosphere.marathon.api.LeaderInfo
+import mesosphere.marathon.core.launchqueue.LaunchQueue
 import mesosphere.marathon.event.{ HistoryActor, EventModule }
 import mesosphere.marathon.event.http.{
   HttpEventStreamActorMetrics,
@@ -29,13 +30,13 @@ import mesosphere.marathon.health.{ HealthCheckManager, MarathonHealthCheckManag
 import mesosphere.marathon.io.storage.StorageProvider
 import mesosphere.marathon.metrics.Metrics
 import mesosphere.marathon.state._
-import mesosphere.marathon.tasks.{ TaskIdUtil, TaskQueue, TaskTracker, _ }
+import mesosphere.marathon.tasks.{ TaskIdUtil, TaskTracker, _ }
 import mesosphere.marathon.upgrade.{ DeploymentManager, DeploymentPlan }
 import mesosphere.util.SerializeExecution
 import mesosphere.util.state.memory.InMemoryStore
 import mesosphere.util.state.mesos.MesosStateStore
 import mesosphere.util.state.zk.ZKStore
-import mesosphere.util.state.{ FrameworkId, FrameworkIdUtil, PersistentStore }
+import mesosphere.util.state._
 import org.apache.log4j.Logger
 import org.apache.mesos.state.ZooKeeperState
 import org.apache.zookeeper.ZooDefs
@@ -79,10 +80,7 @@ class MarathonModule(conf: MarathonConf, http: HttpConf, zk: ZooKeeperClient)
     bind(classOf[MarathonSchedulerService]).in(Scopes.SINGLETON)
     bind(classOf[LeaderInfo]).to(classOf[MarathonLeaderInfo]).in(Scopes.SINGLETON)
     bind(classOf[TaskTracker]).in(Scopes.SINGLETON)
-    bind(classOf[TaskQueue]).in(Scopes.SINGLETON)
     bind(classOf[TaskFactory]).to(classOf[DefaultTaskFactory]).in(Scopes.SINGLETON)
-    bind(classOf[IterativeOfferMatcherMetrics]).in(Scopes.SINGLETON)
-    bind(classOf[OfferMatcher]).to(classOf[IterativeOfferMatcher]).in(Scopes.SINGLETON)
 
     bind(classOf[HealthCheckManager]).to(classOf[MarathonHealthCheckManager]).asEagerSingleton()
 
@@ -101,6 +99,15 @@ class MarathonModule(conf: MarathonConf, http: HttpConf, zk: ZooKeeperClient)
 
   }
 
+  @Provides
+  @Singleton
+  def provideMesosLeaderInfo(): MesosLeaderInfo = {
+    conf.mesosLeaderUiUrl.get match {
+      case someUrl @ Some(_) => ConstMesosLeaderInfo(someUrl)
+      case None              => new MutableMesosLeaderInfo
+    }
+  }
+
   @Named(ModuleNames.NAMED_HTTP_EVENT_STREAM)
   @Provides
   @Singleton
@@ -114,10 +121,6 @@ class MarathonModule(conf: MarathonConf, http: HttpConf, zk: ZooKeeperClient)
 
     system.actorOf(Props(new HttpEventStreamActor(leaderInfo, metrics, handleStreamProps)), "HttpEventStream")
   }
-
-  @Provides
-  @Singleton
-  def provideIterativeOfferMatcherConfig(): IterativeOfferMatcherConfig = conf
 
   @Provides
   @Singleton
@@ -158,10 +161,11 @@ class MarathonModule(conf: MarathonConf, http: HttpConf, zk: ZooKeeperClient)
     @Named("restMapper") mapper: ObjectMapper,
     system: ActorSystem,
     appRepository: AppRepository,
+    groupRepository: GroupRepository,
     deploymentRepository: DeploymentRepository,
     healthCheckManager: HealthCheckManager,
     taskTracker: TaskTracker,
-    taskQueue: TaskQueue,
+    taskQueue: LaunchQueue,
     frameworkIdUtil: FrameworkIdUtil,
     driverHolder: MarathonSchedulerDriverHolder,
     taskIdUtil: TaskIdUtil,
@@ -179,6 +183,7 @@ class MarathonModule(conf: MarathonConf, http: HttpConf, zk: ZooKeeperClient)
     def createSchedulerActions(schedulerActor: ActorRef): SchedulerActions = {
       new SchedulerActions(
         appRepository,
+        groupRepository,
         healthCheckManager,
         taskTracker,
         taskQueue,
@@ -224,7 +229,8 @@ class MarathonModule(conf: MarathonConf, http: HttpConf, zk: ZooKeeperClient)
   @Provides
   @Singleton
   def provideHostPort: String = {
-    "%s:%d".format(conf.hostname(), http.httpPort())
+    val port = if (http.disableHttp()) http.httpsPort() else http.httpPort()
+    "%s:%d".format(conf.hostname(), port)
   }
 
   @Named(ModuleNames.NAMED_CANDIDATE)
@@ -375,13 +381,13 @@ class MarathonModule(conf: MarathonConf, http: HttpConf, zk: ZooKeeperClient)
 
     metrics.gauge("service.mesosphere.marathon.app.count", new Gauge[Int] {
       override def getValue: Int = {
-        Await.result(groupManager.root(false), conf.zkTimeoutDuration).transitiveApps.size
+        Await.result(groupManager.rootGroup(), conf.zkTimeoutDuration).transitiveApps.size
       }
     })
 
     metrics.gauge("service.mesosphere.marathon.group.count", new Gauge[Int] {
       override def getValue: Int = {
-        Await.result(groupManager.root(false), conf.zkTimeoutDuration).transitiveGroups.size
+        Await.result(groupManager.rootGroup(), conf.zkTimeoutDuration).transitiveGroups.size
       }
     })
 

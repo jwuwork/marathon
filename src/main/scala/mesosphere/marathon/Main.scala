@@ -7,6 +7,7 @@ import mesosphere.chaos.{ App, AppConfiguration }
 import mesosphere.chaos.http.{ HttpConf, HttpModule, HttpService }
 import mesosphere.chaos.metrics.MetricsModule
 import mesosphere.marathon.api.MarathonRestModule
+import mesosphere.marathon.core.CoreGuiceModule
 import mesosphere.marathon.event.http.{ HttpEventConfiguration, HttpEventModule }
 import mesosphere.marathon.event.{ EventConfiguration, EventModule }
 import org.apache.log4j.Logger
@@ -48,15 +49,13 @@ class MarathonApp extends App {
 
   def modules(): Seq[Module] = {
     Seq(
-      new HttpModule(conf) {
-        // burst browser cache for assets
-        protected override val resourceCacheControlHeader = Some("max-age=0, must-revalidate")
-      },
+      new HttpModule(conf),
       new MetricsModule,
       new MarathonModule(conf, conf, zk),
       new MarathonRestModule,
       new EventModule(conf),
-      new DebugModule(conf)
+      new DebugModule(conf),
+      new CoreGuiceModule
     ) ++ getEventsModule
   }
 

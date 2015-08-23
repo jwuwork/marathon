@@ -1,49 +1,107 @@
 package mesosphere.marathon.api.v2
 
 import mesosphere.marathon.api.v2.json.Formats._
+import mesosphere.marathon.api.v2.json.V2AppDefinition
+import mesosphere.marathon.core.base.ConstantClock
+import mesosphere.marathon.core.launchqueue.LaunchQueue
+import mesosphere.marathon.core.launchqueue.LaunchQueue.QueuedTaskCount
 import mesosphere.marathon.state.AppDefinition
 import mesosphere.marathon.state.PathId._
 import mesosphere.marathon.{ MarathonConf, MarathonSpec }
-import mesosphere.marathon.tasks.TaskQueue
+import mesosphere.util.Mockito
 import org.scalatest.Matchers
-import play.api.libs.json.{ JsObject, Json }
+import play.api.libs.json._
 
-class QueueResourceTest extends MarathonSpec with Matchers {
+import scala.collection.immutable.Seq
+import scala.concurrent.duration._
 
-  // regression test for #1210
+class QueueResourceTest extends MarathonSpec with Matchers with Mockito {
+
   test("return well formatted JSON") {
-    val queue = new TaskQueue
-    val app1 = AppDefinition(id = "app1".toRootPath)
-    val app2 = AppDefinition(id = "app2".toRootPath)
-    val resource = new QueueResource(queue, mock[MarathonConf])
-
-    queue.add(app1, 4)
-    queue.add(app2, 2)
-
-    for (_ <- 0 until 10)
-      queue.rateLimiter.addDelay(app2)
-
-    val json = Json.parse(resource.index().getEntity.toString)
-
-    val queuedApp1 = Json.obj(
-      "count" -> 4,
-      "delay" -> Json.obj(
-        "overdue" -> true
-      ),
-      "app" -> app1
+    //given
+    val queue = mock[LaunchQueue]
+    val app = AppDefinition(id = "app".toRootPath)
+    val clock: ConstantClock = ConstantClock()
+    val resource = new QueueResource(clock, queue, mock[MarathonConf])
+    queue.list returns Seq(
+      QueuedTaskCount(
+        app, tasksLeftToLaunch = 23, taskLaunchesInFlight = 0, tasksLaunchedOrRunning = 0, clock.now() + 100.seconds
+      )
     )
 
-    val queuedApp2 = Json.obj(
-      "count" -> 2,
-      "delay" -> Json.obj(
-        "overdue" -> false
-      ),
-      "app" -> app2
-    )
+    //when
+    val response = resource.index()
 
+    //then
+    response.getStatus should be(200)
+    val json = Json.parse(response.getEntity.asInstanceOf[String])
     val queuedApps = (json \ "queue").as[Seq[JsObject]]
+    val jsonApp1 = queuedApps.find(_ \ "app" \ "id" == JsString("/app")).get
 
-    assert(queuedApps.contains(queuedApp1))
-    assert(queuedApps.contains(queuedApp2))
+    jsonApp1 \ "app" should be(Json.toJson(V2AppDefinition(app)))
+    jsonApp1 \ "count" should be(Json.toJson(23))
+    jsonApp1 \ "delay" \ "overdue" should be(Json.toJson(false))
+    (jsonApp1 \ "delay" \ "timeLeftSeconds").as[Int] should be(100) //the deadline holds the current time...
+  }
+
+  test("the generated info from the queue contains 0 if there is no delay") {
+    //given
+    val queue = mock[LaunchQueue]
+    val app = AppDefinition(id = "app".toRootPath)
+    val clock: ConstantClock = ConstantClock()
+    val resource = new QueueResource(clock, queue, mock[MarathonConf])
+    queue.list returns Seq(
+      QueuedTaskCount(
+        app, tasksLeftToLaunch = 23, taskLaunchesInFlight = 0, tasksLaunchedOrRunning = 0,
+        backOffUntil = clock.now() - 100.seconds
+      )
+    )
+    //when
+    val response = resource.index()
+
+    //then
+    response.getStatus should be(200)
+    val json = Json.parse(response.getEntity.asInstanceOf[String])
+    val queuedApps = (json \ "queue").as[Seq[JsObject]]
+    val jsonApp1 = queuedApps.find(_ \ "app" \ "id" == JsString("/app")).get
+
+    jsonApp1 \ "app" should be(Json.toJson(V2AppDefinition(app)))
+    jsonApp1 \ "count" should be(Json.toJson(23))
+    jsonApp1 \ "delay" \ "overdue" should be(Json.toJson(true))
+    jsonApp1 \ "delay" \ "timeLeftSeconds" should be(Json.toJson(0))
+  }
+
+  test("unknown application backoff can not be removed from the taskqueue") {
+    //given
+    val queue = mock[LaunchQueue]
+    val resource = new QueueResource(ConstantClock(), queue, mock[MarathonConf])
+    queue.list returns Seq.empty
+
+    //when
+    val response = resource.resetDelay("unknown")
+
+    //then
+    response.getStatus should be(404)
+  }
+
+  test("application backoff can be removed from the taskqueue") {
+    //given
+    val queue = mock[LaunchQueue]
+    val app = AppDefinition(id = "app".toRootPath)
+    val clock: ConstantClock = ConstantClock()
+    val resource = new QueueResource(clock, queue, mock[MarathonConf])
+    queue.list returns Seq(
+      QueuedTaskCount(
+        app, tasksLeftToLaunch = 23, taskLaunchesInFlight = 0, tasksLaunchedOrRunning = 0,
+        backOffUntil = clock.now() + 100.seconds
+      )
+    )
+
+    //when
+    val response = resource.resetDelay("app")
+
+    //then
+    response.getStatus should be(204)
+    verify(queue, times(1)).resetDelay(app)
   }
 }

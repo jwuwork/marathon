@@ -7,10 +7,11 @@ import mesosphere.marathon.state.Container.Docker
 import mesosphere.marathon.state.Container.Docker.PortMapping
 import mesosphere.marathon.state.PathId._
 import mesosphere.marathon.state.{ AppDefinition, Container, PathId, Timestamp }
-import mesosphere.marathon.tasks.{ MarathonTasks, TaskTracker }
+import mesosphere.marathon.tasks.{ TaskIdUtil, MarathonTasks, TaskTracker }
 import mesosphere.mesos.protos.{ Resource, TaskID, _ }
 import org.apache.mesos.Protos.ContainerInfo.DockerInfo.Network
 import org.apache.mesos.Protos.{ Offer, _ }
+import org.joda.time.{ DateTimeZone, DateTime }
 import org.mockito.Mockito._
 import org.mockito.invocation.InvocationOnMock
 import org.mockito.stubbing.Answer
@@ -421,9 +422,9 @@ class TaskBuilderTest extends MarathonSpec {
     when(taskTracker.get(app.id)).thenReturn(s)
 
     val builder = new TaskBuilder(app,
-      s => TaskID(s.toString), taskTracker, defaultConfig())
+      s => TaskID(s.toString), defaultConfig())
 
-    val task = builder.buildIfMatches(offer)
+    val task = builder.buildIfMatches(offer, taskTracker.get(app.id))
 
     assert(task.isDefined)
     // TODO test for resources etc.
@@ -447,22 +448,23 @@ class TaskBuilderTest extends MarathonSpec {
     })
 
     val builder = new TaskBuilder(app,
-      s => TaskID(s.toString), taskTracker, defaultConfig())
+      s => TaskID(s.toString), defaultConfig())
 
     def shouldBuildTask(message: String, offer: Offer) {
-      val tupleOption = builder.buildIfMatches(offer)
+      val tupleOption = builder.buildIfMatches(offer, taskTracker.get(app.id))
       assert(tupleOption.isDefined, message)
       val marathonTask = MarathonTasks.makeTask(
         tupleOption.get._1.getTaskId.getValue,
         offer.getHostname,
         tupleOption.get._2,
         offer.getAttributesList.asScala.toList,
-        Timestamp.now())
+        Timestamp.now(),
+        offer.slaveId)
       runningTasks += marathonTask
     }
 
     def shouldNotBuildTask(message: String, offer: Offer) {
-      val tupleOption = builder.buildIfMatches(offer)
+      val tupleOption = builder.buildIfMatches(offer, taskTracker.get(app.id))
       assert(tupleOption.isEmpty, message)
     }
 
@@ -508,21 +510,22 @@ class TaskBuilderTest extends MarathonSpec {
     })
 
     val builder = new TaskBuilder(app,
-      s => TaskID(s.toString), taskTracker, defaultConfig())
+      s => TaskID(s.toString), defaultConfig())
 
     def shouldBuildTask(message: String, offer: Offer) {
-      val tupleOption = builder.buildIfMatches(offer)
+      val tupleOption = builder.buildIfMatches(offer, taskTracker.get(app.id))
       assert(tupleOption.isDefined, message)
       val marathonTask = MarathonTasks.makeTask(
         tupleOption.get._1.getTaskId.getValue,
         offer.getHostname,
         tupleOption.get._2,
-        offer.getAttributesList.asScala.toList, Timestamp.now())
+        offer.getAttributesList.asScala.toList, Timestamp.now(),
+        offer.slaveId)
       runningTasks += marathonTask
     }
 
     def shouldNotBuildTask(message: String, offer: Offer) {
-      val tupleOption = builder.buildIfMatches(offer)
+      val tupleOption = builder.buildIfMatches(offer, taskTracker.get(app.id))
       assert(tupleOption.isEmpty, message)
     }
 
@@ -562,17 +565,73 @@ class TaskBuilderTest extends MarathonSpec {
     assert("1002" == env("PORT_8080"))
   }
 
+  test("TaskContextEnv empty when no taskId given") {
+    val app = AppDefinition(
+      id = PathId("/app"),
+      version = Timestamp(new DateTime(2015, 2, 3, 12, 30, DateTimeZone.UTC))
+    )
+    val env = TaskBuilder.taskContextEnv(app = app, taskId = None)
+
+    assert(env == Map.empty)
+  }
+
+  test("TaskContextEnv minimal") {
+    val app = AppDefinition(
+      id = PathId("/app"),
+      version = Timestamp(new DateTime(2015, 2, 3, 12, 30, DateTimeZone.UTC))
+    )
+    val env = TaskBuilder.taskContextEnv(app = app, taskId = Some(TaskID("taskId")))
+
+    assert(
+      env == Map(
+        "MESOS_TASK_ID" -> "taskId",
+        "MARATHON_APP_ID" -> "/app",
+        "MARATHON_APP_VERSION" -> "2015-02-03T12:30:00.000Z"
+      )
+    )
+  }
+
+  test("TaskContextEnv all fields") {
+    val taskId = TaskID("taskId")
+    val app = AppDefinition(
+      id = PathId("/app"),
+      version = Timestamp(new DateTime(2015, 2, 3, 12, 30, DateTimeZone.UTC)),
+      container = Some(Container(
+        docker = Some(Docker(
+          image = "myregistry/myimage:version"
+        ))
+      ))
+    )
+    val env = TaskBuilder.taskContextEnv(app = app, Some(taskId))
+
+    assert(
+      env == Map(
+        "MESOS_TASK_ID" -> "taskId",
+        "MARATHON_APP_ID" -> "/app",
+        "MARATHON_APP_VERSION" -> "2015-02-03T12:30:00.000Z",
+        "MARATHON_APP_DOCKER_IMAGE" -> "myregistry/myimage:version"
+      )
+    )
+  }
+
   test("AppContextEnvironment") {
     val command =
       TaskBuilder.commandInfo(
-        AppDefinition(
+        app = AppDefinition(
           id = "/test".toPath,
           ports = Seq(8080, 8081),
-          version = Timestamp(0)
+          version = Timestamp(0),
+          container = Some(Container(
+            docker = Some(Docker(
+              image = "myregistry/myimage:version"
+            ))
+          )
+          )
         ),
-        Some(TaskID("task-123")),
-        Some("host.mega.corp"),
-        Seq(1000, 1001)
+        taskId = Some(TaskID("task-123")),
+        host = Some("host.mega.corp"),
+        ports = Seq(1000, 1001),
+        envPrefix = None
       )
     val env: Map[String, String] =
       command.getEnvironment.getVariablesList.asScala.toList.map(v => v.getName -> v.getValue).toMap
@@ -580,6 +639,7 @@ class TaskBuilderTest extends MarathonSpec {
     assert("task-123" == env("MESOS_TASK_ID"))
     assert("/test" == env("MARATHON_APP_ID"))
     assert("1970-01-01T00:00:00.000Z" == env("MARATHON_APP_VERSION"))
+    assert("myregistry/myimage:version" == env("MARATHON_APP_DOCKER_IMAGE"))
   }
 
   test("user defined variables override automatic port variables") {
@@ -588,7 +648,7 @@ class TaskBuilderTest extends MarathonSpec {
 
     val command =
       TaskBuilder.commandInfo(
-        AppDefinition(
+        app = AppDefinition(
           id = "/test".toPath,
           ports = Seq(8080, 8081),
           version = Timestamp(0),
@@ -601,9 +661,10 @@ class TaskBuilderTest extends MarathonSpec {
             "PORT_8081" -> "port8081"
           )
         ),
-        Some(TaskID("task-123")),
-        Some("host.mega.corp"),
-        Seq(1000, 1001)
+        taskId = Some(TaskID("task-123")),
+        host = Some("host.mega.corp"),
+        ports = Seq(1000, 1001),
+        envPrefix = None
       )
     val env: Map[String, String] =
       command.getEnvironment.getVariablesList.asScala.toList.map(v => v.getName -> v.getValue).toMap
@@ -619,12 +680,13 @@ class TaskBuilderTest extends MarathonSpec {
   test("PortsEnvWithOnlyPorts") {
     val command =
       TaskBuilder.commandInfo(
-        AppDefinition(
+        app = AppDefinition(
           ports = Seq(8080, 8081)
         ),
-        Some(TaskID("task-123")),
-        Some("host.mega.corp"),
-        Seq(1000, 1001)
+        taskId = Some(TaskID("task-123")),
+        host = Some("host.mega.corp"),
+        ports = Seq(1000, 1001),
+        envPrefix = None
       )
     val env: Map[String, String] =
       command.getEnvironment.getVariablesList.asScala.toList.map(v => v.getName -> v.getValue).toMap
@@ -633,10 +695,60 @@ class TaskBuilderTest extends MarathonSpec {
     assert("1001" == env("PORT_8081"))
   }
 
-  test("PortsEnvWithOnlyMappings") {
+  test("PortsEnvWithCustomPrefix") {
     val command =
       TaskBuilder.commandInfo(
         AppDefinition(
+          ports = Seq(8080, 8081)
+        ),
+        Some(TaskID("task-123")),
+        Some("host.mega.corp"),
+        Seq(1000, 1001),
+        Some("CUSTOM_PREFIX_")
+      )
+    val env: Map[String, String] =
+      command.getEnvironment.getVariablesList.asScala.toList.map(v => v.getName -> v.getValue).toMap
+
+    assert("1000,1001" == env("CUSTOM_PREFIX_PORTS"))
+
+    assert("1000" == env("CUSTOM_PREFIX_PORT"))
+
+    assert("1000" == env("CUSTOM_PREFIX_PORT0"))
+    assert("1000" == env("CUSTOM_PREFIX_PORT_8080"))
+
+    assert("1001" == env("CUSTOM_PREFIX_PORT1"))
+    assert("1001" == env("CUSTOM_PREFIX_PORT_8081"))
+
+    assert("host.mega.corp" == env("CUSTOM_PREFIX_HOST"))
+
+    assert(Seq("HOST", "PORTS", "PORT0", "PORT1").forall(k => !env.contains(k)))
+    assert(Seq("MESOS_TASK_ID", "MARATHON_APP_ID", "MARATHON_APP_VERSION").forall(env.contains))
+  }
+
+  test("OnlyWhitelistedUnprefixedVariablesWithCustomPrefix") {
+    val command =
+      TaskBuilder.commandInfo(
+        AppDefinition(
+          ports = Seq(8080, 8081)
+        ),
+        Some(TaskID("task-123")),
+        Some("host.mega.corp"),
+        Seq(1000, 1001),
+        Some("P_")
+      )
+    val env: Map[String, String] =
+      command.getEnvironment.getVariablesList.asScala.toList.map(v => v.getName -> v.getValue).toMap
+
+    val nonPrefixedEnvVars = env.filterKeys(!_.startsWith("P_"))
+    val whiteList = Seq("MESOS_TASK_ID", "MARATHON_APP_ID", "MARATHON_APP_VERSION")
+
+    assert(nonPrefixedEnvVars.keySet.forall(whiteList.contains))
+  }
+
+  test("PortsEnvWithOnlyMappings") {
+    val command =
+      TaskBuilder.commandInfo(
+        app = AppDefinition(
           container = Some(Container(
             docker = Some(Docker(
               network = Some(Network.BRIDGE),
@@ -647,9 +759,10 @@ class TaskBuilderTest extends MarathonSpec {
             ))
           ))
         ),
-        Some(TaskID("task-123")),
-        Some("host.mega.corp"),
-        Seq(1000, 1001)
+        taskId = Some(TaskID("task-123")),
+        host = Some("host.mega.corp"),
+        ports = Seq(1000, 1001),
+        envPrefix = None
       )
     val env: Map[String, String] =
       command.getEnvironment.getVariablesList.asScala.toList.map(v => v.getName -> v.getValue).toMap
@@ -661,7 +774,7 @@ class TaskBuilderTest extends MarathonSpec {
   test("PortsEnvWithBothPortsAndMappings") {
     val command =
       TaskBuilder.commandInfo(
-        AppDefinition(
+        app = AppDefinition(
           ports = Seq(22, 23),
           container = Some(Container(
             docker = Some(Docker(
@@ -673,9 +786,10 @@ class TaskBuilderTest extends MarathonSpec {
             ))
           ))
         ),
-        Some(TaskID("task-123")),
-        Some("host.mega.corp"),
-        Seq(1000, 1001)
+        taskId = Some(TaskID("task-123")),
+        host = Some("host.mega.corp"),
+        ports = Seq(1000, 1001),
+        envPrefix = None
       )
     val env: Map[String, String] =
       command.getEnvironment.getVariablesList.asScala.toList.map(v => v.getName -> v.getValue).toMap
@@ -691,19 +805,19 @@ class TaskBuilderTest extends MarathonSpec {
 
     val command =
       TaskBuilder.commandInfo(
-        AppDefinition(
+        app = AppDefinition(
           id = "testApp".toPath,
           cpus = 1.0,
           mem = 64.0,
           disk = 1.0,
           executor = "//cmd",
-          uris = Seq("http://www.example.com", "http://www.example.com/test.tgz",
-            "example.tar.gz"),
+          uris = Seq("http://www.example.com", "http://www.example.com/test.tgz", "example.tar.gz"),
           ports = Seq(8080, 8081)
         ),
-        Some(TaskID("task-123")),
-        Some("host.mega.corp"),
-        Seq(1000, 1001)
+        taskId = Some(TaskID("task-123")),
+        host = Some("host.mega.corp"),
+        ports = Seq(1000, 1001),
+        envPrefix = None
       )
 
     val uriinfo1 = command.getUris(0)
@@ -716,17 +830,21 @@ class TaskBuilderTest extends MarathonSpec {
   }
 
   def buildIfMatches(
-    offer: Offer, app: AppDefinition, mesosRole: Option[String] = None,
-    acceptedResourceRoles: Option[Set[String]] = None) = {
+    offer: Offer,
+    app: AppDefinition,
+    mesosRole: Option[String] = None,
+    acceptedResourceRoles: Option[Set[String]] = None,
+    envVarsPrefix: Option[String] = None) = {
     val taskTracker = mock[TaskTracker]
 
     val builder = new TaskBuilder(app,
-      s => TaskID(s.toString), taskTracker,
+      s => TaskID(s.toString),
       defaultConfig(
         mesosRole = mesosRole,
-        acceptedResourceRoles = acceptedResourceRoles))
+        acceptedResourceRoles = acceptedResourceRoles,
+        envVarsPrefix = envVarsPrefix))
 
-    builder.buildIfMatches(offer)
+    builder.buildIfMatches(offer, taskTracker.get(app.id))
   }
 
   def makeSampleTask(id: PathId, attr: String, attrVal: String) = {

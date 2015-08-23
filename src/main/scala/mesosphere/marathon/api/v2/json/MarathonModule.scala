@@ -11,7 +11,6 @@ import com.fasterxml.jackson.databind.deser.Deserializers
 import com.fasterxml.jackson.databind.ser.Serializers
 import org.apache.mesos.{ Protos => mesos }
 import mesosphere.marathon.Protos.{ Constraint, MarathonTask }
-import mesosphere.marathon.api.v2._
 import mesosphere.marathon.api.validation.FieldConstraints._
 import mesosphere.marathon.health.HealthCheck
 import mesosphere.marathon.state.PathId._
@@ -28,9 +27,10 @@ class MarathonModule extends Module {
   private val enrichedTaskClass = classOf[EnrichedTask]
   private val timestampClass = classOf[Timestamp]
   private val finiteDurationClass = classOf[FiniteDuration]
-  private val appUpdateClass = classOf[AppUpdate]
+  private val appUpdateClass = classOf[V2AppUpdate]
   private val groupIdClass = classOf[PathId]
   private val taskIdClass = classOf[mesos.TaskID]
+  private val slaveIdClass = classOf[mesos.SlaveID]
 
   def getModuleName: String = "MarathonModule"
 
@@ -52,6 +52,7 @@ class MarathonModule extends Module {
         else if (matches(finiteDurationClass)) FiniteDurationSerializer
         else if (matches(groupIdClass)) PathIdSerializer
         else if (matches(taskIdClass)) TaskIdSerializer
+        else if (matches(slaveIdClass)) SlaveIdSerializer
         else null
       }
     })
@@ -69,6 +70,7 @@ class MarathonModule extends Module {
         else if (matches(appUpdateClass)) AppUpdateDeserializer
         else if (matches(groupIdClass)) PathIdDeserializer
         else if (matches(taskIdClass)) TaskIdDeserializer
+        else if (matches(slaveIdClass)) SlaveIdDeserializer
         else null
       }
     })
@@ -149,6 +151,7 @@ class MarathonModule extends Module {
       jgen.writeObjectField("id", task.getId)
       jgen.writeObjectField("host", task.getHost)
       jgen.writeObjectField("ports", task.getPortsList)
+      jgen.writeObjectField("slaveId", task.getSlaveId.getValue)
       jgen.writeObjectField("startedAt", if (startedAt == 0) null else Timestamp(startedAt))
       jgen.writeObjectField("stagedAt", if (stagedAt == 0) null else Timestamp(stagedAt))
       jgen.writeObjectField("version", task.getVersion)
@@ -204,8 +207,21 @@ class MarathonModule extends Module {
     }
   }
 
-  object AppUpdateDeserializer extends JsonDeserializer[AppUpdate] {
-    override def deserialize(json: JsonParser, context: DeserializationContext): AppUpdate = {
+  object SlaveIdSerializer extends JsonSerializer[mesos.SlaveID] {
+    def serialize(id: mesos.SlaveID, jgen: JsonGenerator, provider: SerializerProvider) {
+      jgen.writeString(id.getValue)
+    }
+  }
+
+  object SlaveIdDeserializer extends JsonDeserializer[mesos.SlaveID] {
+    def deserialize(json: JsonParser, context: DeserializationContext): mesos.SlaveID = {
+      val tree: JsonNode = json.getCodec.readTree(json)
+      mesos.SlaveID.newBuilder.setValue(tree.textValue).build
+    }
+  }
+
+  object AppUpdateDeserializer extends JsonDeserializer[V2AppUpdate] {
+    override def deserialize(json: JsonParser, context: DeserializationContext): V2AppUpdate = {
       val oc = json.getCodec
       val tree: JsonNode = oc.readTree(json)
       val containerDeserializer = context.findRootValueDeserializer(
@@ -215,7 +231,7 @@ class MarathonModule extends Module {
       val emptyContainer = tree.has("container") && tree.get("container").isNull
 
       val appUpdate =
-        tree.traverse(oc).readValueAs(classOf[AppUpdateBuilder]).build()
+        tree.traverse(oc).readValueAs(classOf[V2AppUpdateBuilder]).build()
 
       if (emptyContainer)
         appUpdate.copy(container = Some(Container.Empty))
@@ -229,7 +245,7 @@ object MarathonModule {
   // TODO: make @JsonDeserialize work on the 'container' field
   // of the 'AppUpdate' class and remove this workaround.
   @JsonIgnoreProperties(ignoreUnknown = true)
-  case class AppUpdateBuilder(
+  case class V2AppUpdateBuilder(
       id: Option[PathId] = None, //needed for updates inside a group
       cmd: Option[String] = None,
       args: Option[Seq[String]] = None,
@@ -255,7 +271,7 @@ object MarathonModule {
       labels: Option[Map[String, String]] = None,
       acceptedResourceRoles: Option[Set[String]] = None,
       version: Option[Timestamp] = None) {
-    def build(): AppUpdate = AppUpdate(
+    def build(): V2AppUpdate = V2AppUpdate(
       id, cmd, args, user, env, instances, cpus, mem, disk, executor, constraints,
       uris, storeUrls, ports, requirePorts, backoff, backoffFactor, maxLaunchDelay,
       container, healthChecks, dependencies, upgradeStrategy, labels,

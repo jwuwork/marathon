@@ -2,15 +2,15 @@ import sbt._
 import Keys._
 import sbtassembly.Plugin._
 import AssemblyKeys._
-import sbtrelease.ReleasePlugin._
 import com.typesafe.sbt.SbtScalariform._
 import net.virtualvoid.sbt.graph.Plugin.graphSettings
-import ohnosequences.sbt.SbtS3Resolver.S3Resolver
-import ohnosequences.sbt.SbtS3Resolver.{ s3, s3resolver }
 import org.scalastyle.sbt.ScalastylePlugin.{ buildSettings => styleSettings }
 import scalariform.formatter.preferences._
 import sbtbuildinfo.Plugin._
 import spray.revolver.RevolverPlugin.Revolver.{settings => revolverSettings}
+import sbtrelease._
+import ReleasePlugin._
+import ReleaseStateTransformations._
 
 object MarathonBuild extends Build {
   lazy val root: Project = Project(
@@ -18,19 +18,20 @@ object MarathonBuild extends Build {
     base = file("."),
     settings = baseSettings ++
                asmSettings ++
-               releaseSettings ++
-               publishSettings ++
+               customReleaseSettings ++
                formatSettings ++
                scalaStyleSettings ++
                revolverSettings ++
                graphSettings ++
                testSettings ++
                integrationTestSettings ++
-      Seq(
-        libraryDependencies ++= Dependencies.root,
-        parallelExecution in Test := false,
-        fork in Test := true
-      )
+               teamCitySetEnvSettings ++
+               Seq(
+                 unmanagedResourceDirectories in Compile += file("docs/docs/rest-api"),
+                 libraryDependencies ++= Dependencies.root,
+                 parallelExecution in Test := false,
+                 fork in Test := true
+               )
     )
     .configs(IntegrationTest)
     // run mesos-simulation/test:test when running test
@@ -90,11 +91,11 @@ object MarathonBuild extends Build {
 
   lazy val baseSettings = Defaults.defaultSettings ++ buildInfoSettings ++ Seq (
     organization := "mesosphere",
-    scalaVersion := "2.11.5",
+    scalaVersion := "2.11.7",
     crossScalaVersions := Seq(scalaVersion.value),
     scalacOptions in Compile ++= Seq(
       "-encoding", "UTF-8",
-      "-target:jvm-1.6",
+      "-target:jvm-1.8",
       "-deprecation",
       "-feature",
       "-unchecked",
@@ -105,7 +106,7 @@ object MarathonBuild extends Build {
       "-Yno-adapted-args",
       "-Ywarn-numeric-widen"
     ),
-    javacOptions in Compile ++= Seq("-encoding", "UTF-8", "-source", "1.6", "-target", "1.6", "-Xlint:unchecked", "-Xlint:deprecation"),
+    javacOptions in Compile ++= Seq("-encoding", "UTF-8", "-source", "1.8", "-target", "1.8", "-Xlint:unchecked", "-Xlint:deprecation"),
     resolvers ++= Seq(
       "Mesosphere Public Repo"    at "http://downloads.mesosphere.io/maven",
       "Typesafe Releases" at "http://repo.typesafe.com/typesafe/releases/",
@@ -141,13 +142,6 @@ object MarathonBuild extends Build {
     }
   )
 
-  lazy val publishSettings = S3Resolver.defaults ++ Seq(
-    publishTo := Some(s3resolver.value(
-      "Mesosphere Public Repo (S3)",
-      s3("downloads.mesosphere.com/maven")
-    ))
-  )
-
   lazy val formatSettings = scalariformSettings ++ Seq(
     ScalariformKeys.preferences := FormattingPreferences()
       .setPreference(IndentWithTabs, false)
@@ -166,6 +160,49 @@ object MarathonBuild extends Build {
       .setPreference(SpacesWithinPatternBinders, true)
       .setPreference(FormatXml, true)
     )
+
+  /**
+   * This is the standard release process without
+   * -publishArtifacts
+   * -setNextVersion
+   * -commitNextVersion
+   */
+  lazy val customReleaseSettings = releaseSettings ++ Seq(
+    ReleaseKeys.releaseProcess := Seq[ReleaseStep](
+      checkSnapshotDependencies,
+      inquireVersions,
+      runTest,
+      setReleaseVersion,
+      commitReleaseVersion,
+      tagRelease,
+      pushChanges
+    ))
+
+  /**
+   * This on load trigger is used to set parameters in teamcity.
+   * It is only executed within teamcity and can be ignored otherwise.
+   * It will set values as build and env parameter.
+   * Those parameters can be used in subsequent build steps and dependent builds.
+   * TeamCity does this by watching the output of the build it currently performs.
+   * See: https://confluence.jetbrains.com/display/TCD8/Build+Script+Interaction+with+TeamCity
+   */
+  lazy val teamCitySetEnvSettings = Seq(
+    onLoad in Global := {
+      sys.env.get("TEAMCITY_VERSION") match {
+        case None => // no-op
+        case Some(teamcityVersion) =>
+          def reportParameter(key: String, value: String): Unit = {
+            //env parameters will be made available as environment variables
+            println(s"##teamcity[setParameter name='env.SBT_$key' value='$value']")
+            //system parameters will be made available as teamcity build parameters
+            println(s"##teamcity[setParameter name='system.sbt.$key' value='$value']")
+          }
+          reportParameter("SCALA_VERSION", scalaVersion.value)
+          reportParameter("PROJECT_VERSION", version.value)
+      }
+      (onLoad in Global).value
+    }
+  )
 }
 
 object Dependencies {
@@ -195,6 +232,8 @@ object Dependencies {
     playJson % "compile",
     jsonSchemaValidator % "compile",
     twitterZk % "compile",
+    rxScala % "compile",
+    marathonUI % "compile",
 
     // test
     Test.scalatest % "test",
@@ -206,7 +245,7 @@ object Dependencies {
 object Dependency {
   object V {
     // runtime deps versions
-    val Chaos = "0.6.5"
+    val Chaos = "0.7.0"
     val JacksonCCM = "0.1.2"
     val MesosUtils = "0.22.1-1"
     val Akka = "2.3.9"
@@ -223,6 +262,8 @@ object Dependency {
     val Scallop = "0.9.5"
     val PlayJson = "2.3.7"
     val JsonSchemaValidator = "2.2.6"
+    val RxScala = "0.25.0"
+    val MarathonUI = "0.11.0-SNAPSHOT"
 
     // test deps versions
     val Mockito = "1.9.5"
@@ -254,6 +295,8 @@ object Dependency {
   val scallop = "org.rogach" %% "scallop" % V.Scallop
   val jsonSchemaValidator = "com.github.fge" % "json-schema-validator" % V.JsonSchemaValidator
   val twitterZk = "com.twitter" %% "util-zk" % V.TwitterZk
+  val rxScala = "io.reactivex" %% "rxscala" % V.RxScala
+  val marathonUI = "mesosphere.marathon" % "ui" % V.MarathonUI
 
   object Test {
     val scalatest = "org.scalatest" %% "scalatest" % V.ScalaTest

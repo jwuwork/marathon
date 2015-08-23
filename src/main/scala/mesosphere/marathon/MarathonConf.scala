@@ -1,18 +1,29 @@
 package mesosphere.marathon
 
-import mesosphere.marathon.tasks.IterativeOfferMatcherConfig
+import mesosphere.marathon.core.flow.{ ReviveOffersConfig, LaunchTokenConfig }
+import mesosphere.marathon.core.launcher.OfferProcessorConfig
+import mesosphere.marathon.core.launchqueue.LaunchQueueConfig
+import mesosphere.marathon.core.matcher.manager.OfferMatcherManagerConfig
 import org.rogach.scallop.ScallopConf
 import scala.sys.SystemProperties
 
 import mesosphere.marathon.io.storage.StorageProvider
 
-trait MarathonConf extends ScallopConf with ZookeeperConf with IterativeOfferMatcherConfig with LeaderProxyConf {
+trait MarathonConf
+    extends ScallopConf with ZookeeperConf with LeaderProxyConf
+    with LaunchTokenConfig with OfferMatcherManagerConfig with OfferProcessorConfig with ReviveOffersConfig
+    with MarathonSchedulerServiceConfig with LaunchQueueConfig {
 
   //scalastyle:off magic.number
 
   lazy val mesosMaster = opt[String]("master",
     descr = "The URL of the Mesos master",
     required = true,
+    noshort = true)
+
+  lazy val mesosLeaderUiUrl = opt[String]("mesos_leader_ui_url",
+    descr = "The host and port (e.g. \"http://mesos_host:5050\") of the Mesos master",
+    required = false,
     noshort = true)
 
   lazy val mesosFailoverTimeout = opt[Long]("failover_timeout",
@@ -44,14 +55,20 @@ trait MarathonConf extends ScallopConf with ZookeeperConf with IterativeOfferMat
     default = Some("//cmd"))
 
   lazy val hostname = opt[String]("hostname",
-    descr = "The advertised hostname stored in ZooKeeper so another standby " +
-      "host can redirect to this elected leader",
+    descr = "The advertised hostname that is used for the communication with the mesos master. " +
+      "The value is also stored in the persistent store so another standby host can redirect to the elected leader.",
     default = Some(java.net.InetAddress.getLocalHost.getHostName))
 
   lazy val webuiUrl = opt[String]("webui_url",
     descr = "The http(s) url of the web ui, defaulting to the advertised hostname",
     noshort = true,
     default = None)
+
+  lazy val maxConcurrentHttpConnections = opt[Int]("http_max_concurrent_requests",
+    descr = "The number of concurrent http requests, that are allowed before rejecting.",
+    noshort = true,
+    default = None
+  )
 
   lazy val accessControlAllowOrigin = opt[String]("access_control_allow_origin",
     descr = "The origin(s) to allow in Marathon. Not set by default. " +
@@ -159,6 +176,11 @@ trait MarathonConf extends ScallopConf with ZookeeperConf with IterativeOfferMat
 
   lazy val mesosAuthenticationSecretFile = opt[String]("mesos_authentication_secret_file",
     descr = "Mesos Authentication Secret",
+    noshort = true
+  )
+
+  lazy val envVarsPrefix = opt[String]("env_vars_prefix",
+    descr = "Prefix to use for environment variables",
     noshort = true
   )
 

@@ -5,15 +5,17 @@ import javax.ws.rs.{ Consumes, GET, Path, Produces }
 
 import com.google.inject.Inject
 import mesosphere.chaos.http.HttpConf
-import mesosphere.marathon.api.LeaderInfo
+import mesosphere.marathon.api.{ MarathonMediaType, LeaderInfo }
 import mesosphere.marathon.event.EventConfiguration
 import mesosphere.marathon.event.http.HttpEventConfiguration
-import mesosphere.marathon.{ LeaderProxyConf, MarathonSchedulerService, BuildInfo, MarathonConf }
+import mesosphere.marathon.{ BuildInfo, LeaderProxyConf, MarathonConf, MarathonSchedulerService }
+import mesosphere.util.state.MesosLeaderInfo
 
 @Path("v2/info")
 @Consumes(Array(MediaType.APPLICATION_JSON))
 class InfoResource @Inject() (
     schedulerService: MarathonSchedulerService,
+    mesosLeaderInfo: MesosLeaderInfo,
     leaderInfo: LeaderInfo,
     conf: MarathonConf with HttpConf with EventConfiguration with HttpEventConfiguration with LeaderProxyConf) {
 
@@ -68,8 +70,9 @@ class InfoResource @Inject() (
   )
 
   @GET
-  @Produces(Array(MediaType.APPLICATION_JSON))
+  @Produces(Array(MarathonMediaType.PREFERRED_APPLICATION_JSON))
   def index(): Response = {
+    val mesosLeaderUiUrl = "mesos_leader_ui_url" -> mesosLeaderInfo.currentLeaderUrl
     Response.ok(
       Map(
         "name" -> BuildInfo.name,
@@ -77,7 +80,7 @@ class InfoResource @Inject() (
         "elected" -> leaderInfo.elected,
         "leader" -> leaderInfo.currentLeaderHostPort(),
         "frameworkId" -> schedulerService.frameworkId.map(_.getValue),
-        "marathon_config" -> marathonConfigValues,
+        "marathon_config" -> (marathonConfigValues + mesosLeaderUiUrl),
         "zookeeper_config" -> zookeeperConfigValues,
         "event_subscriber" -> conf.eventSubscriber.get.map(_ => eventHandlerConfigValues),
         "http_config" -> httpConfigValues)).build()

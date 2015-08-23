@@ -4,17 +4,20 @@ title: Running Docker Containers on Marathon
 
 # Running Docker Containers on Marathon
 
-This document describes how to run [Docker](https://docker.com/) containers using
-the native Docker support added in Apache Mesos version 0.20.0
+This document describes how to run [Docker](https://docker.com/) containers on
+Marathon using the native Docker support added in Apache Mesos version 0.20.0
 (released August 2014).
 
-### Prerequisites
+## Configuration
 
-## Docker
+Note that DCOS clusters are already configured to run Docker containers, so 
+DCOS users do not need to follow the steps below.
 
-Docker version 1.0.0 or later installed on each slave node.
+#### Prerequisites
 
-### Configure mesos-slave
++ Docker version 1.0.0 or later installed on each slave node.
+
+#### Configure mesos-slave
 
   <div class="alert alert-info">
     <strong>Note:</strong> All commands below assume `mesos-slave` is being run
@@ -42,15 +45,12 @@ Docker version 1.0.0 or later installed on each slave node.
 
 3. Restart `mesos-slave` process to load the new configuration
 
-### Configure Marathon
+#### Configure Marathon
 
 1. Increase the Marathon [command line option]({{ site.baseurl }}/docs/command-line-flags.html)
 `--task_launch_timeout` to at least the executor timeout, in milliseconds, 
 you set on your slaves in the previous step.
 
-### Resources
-
-- [Mesos Docker Containerizer](http://mesos.apache.org/documentation/latest/docker-containerizer)
 
 ## Overview
 
@@ -176,10 +176,9 @@ documentation for more details on how Docker handles networking.
 
 ### Using a Private Docker Repository
 
-To supply credentials to pull from a private repository, add a `.dockercfg` to
-the `uris` field of your app. The `$HOME` environment variable will then be set
-to the same value as `$MESOS_SANDBOX` so Docker can automatically pick up the
-config file.
+See the [private registry]({{ site.baseurl }}/docs/native-docker-private-registry.html)
+documentation for more details on how to initiate a `docker pull` from a private docker registry
+using marathon.
 
 ### Advanced Usage
 
@@ -238,6 +237,16 @@ and execute `echo hello`:
 }
 ```
 
+Named arguments can be passed as an array of consecutive `argc, argv` tuples,
+e.g.:
+
+```json
+   "args": [
+      "--name", "etcd0",
+      "--initial-cluster-state", "new"
+    ]
+```
+
 #### Privileged Mode and Arbitrary Docker Options
 
 Starting with version 0.7.6, Marathon supports two new keys for docker
@@ -271,3 +280,6 @@ the future, as Mesos may not always interact with Docker via the CLI.
 }
 ```
 
+## Resources
+
+- [Mesos Docker Containerizer](http://mesos.apache.org/documentation/latest/docker-containerizer)

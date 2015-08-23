@@ -1,5 +1,5 @@
 [![Stories in Ready](https://badge.waffle.io/mesosphere/marathon.png?label=ready&title=Ready)](https://waffle.io/mesosphere/marathon)
-# [Marathon](https://mesosphere.github.io/marathon/) [![Build Status](https://travis-ci.org/mesosphere/marathon.png?branch=master)](https://travis-ci.org/mesosphere/marathon)
+# [Marathon](https://mesosphere.github.io/marathon/) [![Build Status](https://travis-ci.org/mesosphere/marathon.png?branch=master)](https://travis-ci.org/mesosphere/marathon) [![Coverage Status](https://coveralls.io/repos/mesosphere/marathon/badge.svg?branch=master)](https://coveralls.io/r/mesosphere/marathon?branch=master)
 
 Marathon is an [Apache Mesos][Mesos] framework for long-running applications. Given that
 you have Mesos running as the kernel for your datacenter, Marathon is the
@@ -123,11 +123,12 @@ To develop on the web UI look into the instructions of the [Marathon UI](https:/
 
 ## Companies using Marathon
 
-Marathon is managing applications on more than 100,000 nodes at these companies, and many more:
+Across all installations Marathon is managing applications on more than 100,000 nodes world-wide. These are some of the companies using it:
 
 * [Airbnb](https://www.airbnb.com/)
 * [Allegro Group](http://www.allegrogroup.com)
 * [Artirix](http://www.artirix.com/)
+* [Corvisa](https://www.corvisa.com/)
 * [bol.com](https://www.bol.com/)
 * [Branding Brand](http://www.brandingbrand.com/)
 * [Daemon](http://www.daemon.com.au/)
@@ -135,20 +136,27 @@ Marathon is managing applications on more than 100,000 nodes at these companies,
 * [Disqus](https://www.disqus.com/)
 * [eBay](http://www.ebay.com/)
 * [The Factory](https://github.com/thefactory/)
+* [Football Radar](http://www.footballradar.com)
 * [Guidewire](http://www.guidewire.com/)
 * [Groupon](http://www.groupon.com/)
+* [GSShop](http://www.gsshop.com/)
 * [HolidayCheck](http://www.holidaycheck.com/)
 * [Human API](https://humanapi.co/)
+* [Indix](http://www.indix.com/)
 * [ING](http://www.ing.com/)
 * [iQIYI](http://www.iqiyi.com/)
 * [Measurence](http://www.measurence.com/)
 * [Motus](http://www.motus.com/)
 * [OpenTable](http://www.opentable.com/)
+* [Orbitz](http://www.orbitz.com/)
 * [Otto](https://www.otto.de/)
 * [PayPal](https://www.paypal.com)
 * [Qubit](http://www.qubitproducts.com/)
 * [RelateIQ](http://relateiq.com/)
+* [Refinery29](https://www.refinery29.com)
 * [Sailthru](http://www.sailthru.com/)
+* [sloppy.io](http://sloppy.io/)
+* [SmartProcure](https://smartprocure.us/)
 * [Strava](https://www.strava.com)
 * [Viadeo](http://www.viadeo.com)
 * [Wikia](http://www.wikia.com)

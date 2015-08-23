@@ -2,24 +2,21 @@ package mesosphere.marathon
 
 import javax.inject.{ Inject, Named }
 
-import akka.actor.{ ActorRef, ActorSystem }
+import akka.actor.ActorSystem
 import akka.event.EventStream
-import mesosphere.marathon.MarathonSchedulerActor.ScaleApp
-import mesosphere.marathon.Protos.MarathonTask
+import mesosphere.marathon.core.base.Clock
+import mesosphere.marathon.core.launcher.OfferProcessor
+import mesosphere.marathon.core.task.bus.TaskStatusObservables.TaskStatusUpdate
+import mesosphere.marathon.core.task.bus.{ MarathonTaskStatus, TaskStatusEmitter }
 import mesosphere.marathon.event._
-import mesosphere.marathon.health.HealthCheckManager
-import mesosphere.marathon.state.{ AppDefinition, AppRepository, PathId, Timestamp }
-import mesosphere.marathon.tasks.TaskQueue.QueuedTask
 import mesosphere.marathon.tasks._
-import mesosphere.mesos.protos
-import mesosphere.util.state.FrameworkIdUtil
+import mesosphere.util.state.{ FrameworkIdUtil, MesosLeaderInfo }
 import org.apache.log4j.Logger
 import org.apache.mesos.Protos._
 import org.apache.mesos.{ Scheduler, SchedulerDriver }
 
-import scala.collection.JavaConverters._
 import scala.concurrent.{ Await, Future }
-import scala.util.{ Failure, Success }
+import scala.util.control.NonFatal
 
 trait SchedulerCallbacks {
   def disconnected(): Unit
@@ -27,13 +24,11 @@ trait SchedulerCallbacks {
 
 class MarathonScheduler @Inject() (
     @Named(EventModule.busName) eventBus: EventStream,
-    offerMatcher: OfferMatcher,
-    @Named("schedulerActor") schedulerActor: ActorRef,
-    appRepo: AppRepository,
-    healthCheckManager: HealthCheckManager,
-    taskTracker: TaskTracker,
-    taskQueue: TaskQueue,
+    clock: Clock,
+    offerProcessor: OfferProcessor,
+    taskStatusEmitter: TaskStatusEmitter,
     frameworkIdUtil: FrameworkIdUtil,
+    mesosLeaderInfo: MesosLeaderInfo,
     taskIdUtil: TaskIdUtil,
     system: ActorSystem,
     config: MarathonConf,
@@ -41,7 +36,6 @@ class MarathonScheduler @Inject() (
 
   private[this] val log = Logger.getLogger(getClass.getName)
 
-  import mesosphere.mesos.protos.Implicits._
   import mesosphere.util.ThreadPoolContext.context
 
   implicit val zkTimeout = config.zkTimeoutDuration
@@ -52,106 +46,36 @@ class MarathonScheduler @Inject() (
     master: MasterInfo): Unit = {
     log.info(s"Registered as ${frameworkId.getValue} to master '${master.getId}'")
     frameworkIdUtil.store(frameworkId)
-
+    mesosLeaderInfo.onNewMasterInfo(master)
     eventBus.publish(SchedulerRegisteredEvent(frameworkId.getValue, master.getHostname))
   }
 
   override def reregistered(driver: SchedulerDriver, master: MasterInfo): Unit = {
     log.info("Re-registered to %s".format(master))
-
+    mesosLeaderInfo.onNewMasterInfo(master)
     eventBus.publish(SchedulerReregisteredEvent(master.getHostname))
   }
 
   override def resourceOffers(driver: SchedulerDriver, offers: java.util.List[Offer]): Unit = {
-    // Check for any tasks which were started but never entered TASK_RUNNING
-    // TODO resourceOffers() doesn't feel like the right place to run this
-    val toKill = taskTracker.checkStagedTasks
-
-    if (toKill.nonEmpty) {
-      log.warn(s"There are ${toKill.size} tasks stuck in staging for more " +
-        s"than ${config.taskLaunchTimeout()}ms which will be killed")
-      log.info(s"About to kill these tasks: $toKill")
-      for (task <- toKill)
-        driver.killTask(protos.TaskID(task.getId))
+    import scala.collection.JavaConverters._
+    offers.asScala.foreach { offer =>
+      val processFuture = offerProcessor.processOffer(offer)
+      processFuture.onComplete {
+        case scala.util.Success(_)           => log.debug(s"Finished processing offer '${offer.getId.getValue}'")
+        case scala.util.Failure(NonFatal(e)) => log.error(s"while processing offer '${offer.getId.getValue}'", e)
+      }
     }
-
-    // remove queued tasks with stale (non-current) app definition versions
-    val appVersions: Map[PathId, Timestamp] =
-      Await.result(appRepo.currentAppVersions(), config.zkTimeoutDuration)
-
-    taskQueue.retain {
-      case QueuedTask(app, _) =>
-        appVersions.get(app.id) contains app.version
-    }
-
-    offerMatcher.processResourceOffers(driver, offers.asScala)
   }
 
   override def offerRescinded(driver: SchedulerDriver, offer: OfferID): Unit = {
     log.info("Offer %s rescinded".format(offer))
   }
 
-  //TODO: fix style issue and enable this scalastyle check
-  //scalastyle:off cyclomatic.complexity method.length
   override def statusUpdate(driver: SchedulerDriver, status: TaskStatus): Unit = {
-
     log.info("Received status update for task %s: %s (%s)"
       .format(status.getTaskId.getValue, status.getState, status.getMessage))
 
-    val appId = taskIdUtil.appId(status.getTaskId)
-
-    // forward health changes to the health check manager
-    val maybeTask = taskTracker.fetchTask(appId, status.getTaskId.getValue)
-    for (marathonTask <- maybeTask)
-      healthCheckManager.update(status, Timestamp(marathonTask.getVersion))
-
-    import org.apache.mesos.Protos.TaskState._
-
-    val killedForFailingHealthChecks =
-      status.getState == TASK_KILLED && status.hasHealthy && !status.getHealthy
-
-    if (status.getState == TASK_ERROR || status.getState == TASK_FAILED || killedForFailingHealthChecks)
-      appRepo.currentVersion(appId).foreach {
-        _.foreach(taskQueue.rateLimiter.addDelay)
-      }
-    status.getState match {
-      case TASK_ERROR | TASK_FAILED | TASK_FINISHED | TASK_KILLED | TASK_LOST =>
-        // Remove from our internal list
-        taskTracker.terminated(appId, status).foreach { taskOption =>
-          taskOption match {
-            case Some(task) => postEvent(status, task)
-            case None       => log.warn(s"Couldn't post event for ${status.getTaskId}")
-          }
-
-          schedulerActor ! ScaleApp(appId)
-        }
-
-      case TASK_RUNNING if !maybeTask.exists(_.hasStartedAt) => // staged, not running
-        taskTracker.running(appId, status).onComplete {
-          case Success(task) =>
-            appRepo.app(appId, Timestamp(task.getVersion)).onSuccess {
-              case maybeApp: Option[AppDefinition] => maybeApp.foreach(taskQueue.rateLimiter.resetDelay)
-            }
-            postEvent(status, task)
-
-          case Failure(t) =>
-            log.warn(s"Couldn't post event for ${status.getTaskId}", t)
-            log.warn(s"Killing task ${status.getTaskId}")
-            driver.killTask(status.getTaskId)
-        }
-
-      case TASK_STAGING if !taskTracker.contains(appId) =>
-        log.warn(s"Received status update for unknown app $appId")
-        log.warn(s"Killing task ${status.getTaskId}")
-        driver.killTask(status.getTaskId)
-
-      case _ =>
-        taskTracker.statusUpdate(appId, status).onSuccess {
-          case None =>
-            log.warn(s"Killing task ${status.getTaskId}")
-            driver.killTask(status.getTaskId)
-        }
-    }
+    taskStatusEmitter.publish(TaskStatusUpdate(timestamp = clock.now(), status.getTaskId, MarathonTaskStatus(status)))
   }
 
   override def frameworkMessage(
@@ -187,34 +111,35 @@ class MarathonScheduler @Inject() (
 
   override def error(driver: SchedulerDriver, message: String) {
     log.warn("Error: %s".format(message))
-    suicide()
+
+    // Currently, it's pretty hard to disambiguate this error from other causes of framework errors.
+    // Watch MESOS-2522 which will add a reason field for framework errors to help with this.
+    // For now the frameworkId is removed for all messages.
+    val removeFrameworkId = true
+    suicide(removeFrameworkId)
   }
 
-  private def suicide(): Unit = {
-    log.fatal("Committing suicide")
+  /**
+    * Exits the JVM process, optionally deleting Marathon's FrameworkID
+    * from the backing persistence store.
+    *
+    * If `removeFrameworkId` is set, the next Marathon process elected
+    * leader will fail to find a stored FrameworkID and invoke `register`
+    * instead of `reregister`.  This is important because on certain kinds
+    * of framework errors (such as exceeding the framework failover timeout),
+    * the scheduler may never re-register with the saved FrameworkID until
+    * the leading Mesos master process is killed.
+    */
+  private def suicide(removeFrameworkId: Boolean): Unit = {
+    log.fatal(s"Committing suicide!")
 
-    //scalastyle:off magic.number
+    if (removeFrameworkId) Await.ready(frameworkIdUtil.expunge(), config.zkTimeoutDuration)
+
     // Asynchronously call sys.exit() to avoid deadlock due to the JVM shutdown hooks
-    Future {
-      sys.exit(9)
-    } onFailure {
-      case t: Throwable => log.fatal("Exception while committing suicide", t)
+    // scalastyle:off magic.number
+    Future(sys.exit(9)).onFailure {
+      case NonFatal(t) => log.fatal("Exception while committing suicide", t)
     }
-  }
-
-  private def postEvent(status: TaskStatus, task: MarathonTask): Unit = {
-    log.info("Sending event notification.")
-    eventBus.publish(
-      MesosStatusUpdateEvent(
-        status.getSlaveId.getValue,
-        status.getTaskId.getValue,
-        status.getState.name,
-        if (status.hasMessage) status.getMessage else "",
-        taskIdUtil.appId(status.getTaskId),
-        task.getHost,
-        task.getPortsList.asScala,
-        task.getVersion
-      )
-    )
+    // scalastyle:on
   }
 }

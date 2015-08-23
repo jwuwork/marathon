@@ -22,6 +22,7 @@ object MarathonSchedulerDriver {
       .setFailoverTimeout(config.mesosFailoverTimeout().toDouble)
       .setUser(config.mesosUser())
       .setCheckpoint(config.checkpoint())
+      .setHostname(config.hostname())
 
     // Set the role, if provided.
     config.mesosRole.get.foreach(frameworkInfoBuilder.setRole)
@@ -67,12 +68,13 @@ object MarathonSchedulerDriver {
 
     log.debug("Start creating new driver")
 
+    val implicitAcknowledgements = false
     val newDriver: MesosSchedulerDriver = credential match {
       case Some(cred) =>
-        new MesosSchedulerDriver(newScheduler, frameworkInfo, config.mesosMaster(), cred)
+        new MesosSchedulerDriver(newScheduler, frameworkInfo, config.mesosMaster(), implicitAcknowledgements, cred)
 
       case None =>
-        new MesosSchedulerDriver(newScheduler, frameworkInfo, config.mesosMaster())
+        new MesosSchedulerDriver(newScheduler, frameworkInfo, config.mesosMaster(), implicitAcknowledgements)
     }
 
     log.debug("Finished creating new driver", newDriver)

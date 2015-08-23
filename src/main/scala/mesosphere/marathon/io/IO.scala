@@ -7,7 +7,7 @@ import scala.annotation.tailrec
 
 import com.google.common.io.ByteStreams
 
-import scala.util.Try
+import scala.util.{ Failure, Success, Try }
 
 object IO {
 
@@ -70,6 +70,7 @@ object IO {
         val byteCount = in.read(buffer)
         if (byteCount >= 0 && continue) {
           out.write(buffer, 0, byteCount)
+          out.flush()
           read()
         }
       }
@@ -82,6 +83,15 @@ object IO {
     val out = new ByteArrayOutputStream()
     transfer(in, out)
     new String(out.toByteArray, "UTF-8")
+  }
+
+  def withResource[T](path: String)(fn: InputStream => T): Option[T] = {
+    Option(getClass.getResourceAsStream(path)).flatMap { stream =>
+      Try(stream.available()) match {
+        case Success(length) => Some(fn(stream))
+        case Failure(ex)     => None
+      }
+    }
   }
 
   def using[A <: Closeable, B](closeable: A)(fn: (A) => B): B = {

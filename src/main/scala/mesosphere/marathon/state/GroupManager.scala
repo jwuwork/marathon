@@ -6,7 +6,8 @@ import javax.inject.{ Inject, Named }
 
 import akka.event.EventStream
 import com.google.inject.Singleton
-import mesosphere.marathon.api.{ BeanValidation, ModelValidation }
+import mesosphere.marathon.api.v2.{ BeanValidation, ModelValidation }
+import mesosphere.marathon.Protos.MarathonTask
 import mesosphere.marathon.event.{ EventModule, GroupChangeFailed, GroupChangeSuccess }
 import mesosphere.marathon.io.PathFun
 import mesosphere.marathon.io.storage.StorageProvider
@@ -36,10 +37,10 @@ class GroupManager @Singleton @Inject() (
     @Named(EventModule.busName) eventBus: EventStream) extends PathFun {
 
   private[this] val log = Logger.getLogger(getClass.getName)
-  private[this] val zkName = "root"
+  private[this] val zkName = groupRepo.zkRootName
 
-  def root(withLatestApps: Boolean = true): Future[Group] =
-    groupRepo.group(zkName, withLatestApps).map(_.getOrElse(Group.empty))
+  def rootGroup(): Future[Group] =
+    groupRepo.group(zkName).map(_.getOrElse(Group.empty))
 
   /**
     * Get all available versions for given group identifier.
@@ -62,7 +63,7 @@ class GroupManager @Singleton @Inject() (
     * @return the group if it is found, otherwise None
     */
   def group(id: PathId): Future[Option[Group]] = {
-    root().map(_.findGroup(_.id == id))
+    rootGroup().map(_.findGroup(_.id == id))
   }
 
   /**
@@ -75,6 +76,15 @@ class GroupManager @Singleton @Inject() (
     groupRepo.group(zkName, version).map {
       _.flatMap(_.findGroup(_.id == id))
     }
+  }
+
+  /**
+    * Get a specific app definition by its id.
+    * @param id the id of the app.
+    * @return the app uf ut is found, otherwise false
+    */
+  def app(id: PathId): Future[Option[AppDefinition]] = {
+    rootGroup().map(_.app(id))
   }
 
   /**
@@ -111,29 +121,29 @@ class GroupManager @Singleton @Inject() (
     */
   def updateApp(
     appId: PathId,
-    fn: AppDefinition => AppDefinition,
+    fn: Option[AppDefinition] => AppDefinition,
     version: Timestamp = Timestamp.now(),
-    force: Boolean = false): Future[DeploymentPlan] =
-    upgrade(appId.parent, _.updateApp(appId, fn, version), version, force)
+    force: Boolean = false,
+    toKill: Set[MarathonTask] = Set.empty): Future[DeploymentPlan] =
+    upgrade(appId.parent, _.updateApp(appId, fn, version), version, force, Map(appId -> toKill))
 
   private def upgrade(
     gid: PathId,
     change: Group => Group,
     version: Timestamp = Timestamp.now(),
-    force: Boolean = false): Future[DeploymentPlan] = serializeUpdates {
+    force: Boolean = false,
+    toKill: Map[PathId, Set[MarathonTask]] = Map.empty): Future[DeploymentPlan] = serializeUpdates {
     log.info(s"Upgrade id:$gid version:$version with force:$force")
 
     def deploy(from: Group, to: Group, resolve: Seq[ResolveArtifacts]): Future[DeploymentPlan] = {
-      val plan = DeploymentPlan(from, to, resolve, version)
+      val plan = DeploymentPlan(from, to, resolve, version, toKill)
       scheduler.deploy(plan, force).map(_ => plan)
     }
 
-    val rootGroup = root(withLatestApps = false)
-
     val deployment = for {
-      from <- rootGroup //ignore the state of the scheduler
+      from <- rootGroup()
       (to, resolve) <- resolveStoreUrls(assignDynamicServicePorts(from, change(from)))
-      _ = BeanValidation.requireValid(ModelValidation.checkGroup(to))
+      _ = BeanValidation.requireValid(ModelValidation.checkGroup(to, "", PathId.empty))
       plan <- deploy(from, to, resolve)
       _ <- groupRepo.store(zkName, to)
     } yield plan
@@ -237,5 +247,4 @@ class GroupManager @Singleton @Inject() (
       group.updateApp(app.id, _ => app, app.version)
     }
   }
-
 }

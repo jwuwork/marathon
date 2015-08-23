@@ -76,8 +76,9 @@ object ForwarderService {
 
     ProcessKeeper.startJavaProcess(
       s"app_${conf.httpPort()}",
+      heapInMegs = 128,
       arguments = List(ForwarderService.className, "helloApp") ++ args,
-      upWhen = _.contains("Started SelectChannelConnector"))
+      upWhen = _.contains("Started ServerConnector"))
   }
 
   def startForwarderProcess(forwardToPort: Int, args: String*): Unit = {
@@ -85,8 +86,9 @@ object ForwarderService {
 
     ProcessKeeper.startJavaProcess(
       s"forwarder_${conf.httpPort()}",
+      heapInMegs = 128,
       arguments = List(ForwarderService.className, "forwarder", forwardToPort.toString) ++ args,
-      upWhen = _.contains("SelectChannelConnector@"))
+      upWhen = _.contains("ServerConnector@"))
   }
 
   def main(args: Array[String]) {
@@ -121,7 +123,9 @@ object ForwarderService {
   private def startImpl(conf: ForwarderConf, leaderModule: Module, assetPath: String = "/tmp"): Service = {
     val injector = Guice.createInjector(
       new MetricsModule, new HttpModule(conf),
-      new ForwarderAppModule(myHostPort = s"localhost:${conf.httpPort()}", conf, conf),
+      new ForwarderAppModule(
+        myHostPort = if (conf.disableHttp()) s"localhost:${conf.httpsPort()}" else s"localhost:${conf.httpPort()}",
+        conf, conf),
       leaderModule
     )
     val http = injector.getInstance(classOf[HttpService])

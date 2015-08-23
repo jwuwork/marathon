@@ -3,9 +3,10 @@ package mesosphere.marathon.upgrade
 import akka.actor.{ Actor, ActorLogging }
 import akka.event.EventStream
 import mesosphere.marathon.SchedulerActions
+import mesosphere.marathon.core.launchqueue.LaunchQueue
 import mesosphere.marathon.event.{ HealthStatusChanged, MarathonHealthCheckEvent, MesosStatusUpdateEvent }
 import mesosphere.marathon.state.AppDefinition
-import mesosphere.marathon.tasks.{ TaskQueue, TaskTracker }
+import mesosphere.marathon.tasks.TaskTracker
 import org.apache.mesos.SchedulerDriver
 
 import scala.concurrent.duration._
@@ -17,7 +18,7 @@ trait StartingBehavior { this: Actor with ActorLogging =>
   def eventBus: EventStream
   def scaleTo: Int
   def nrToStart: Int
-  def taskQueue: TaskQueue
+  def taskQueue: LaunchQueue
   def driver: SchedulerDriver
   def scheduler: SchedulerActions
   def taskTracker: TaskTracker
@@ -74,7 +75,7 @@ trait StartingBehavior { this: Actor with ActorLogging =>
       taskQueue.add(app)
 
     case Sync =>
-      val actualSize = taskQueue.count(app.id) + taskTracker.count(app.id)
+      val actualSize = taskQueue.get(app.id).map(_.totalTaskCount).getOrElse(taskTracker.count(app.id))
       val tasksToStartNow = Math.max(scaleTo - actualSize, 0)
       if (tasksToStartNow > 0) {
         log.info(s"Reconciling tasks during app ${app.id.toString} scaling: queuing ${tasksToStartNow} new tasks")

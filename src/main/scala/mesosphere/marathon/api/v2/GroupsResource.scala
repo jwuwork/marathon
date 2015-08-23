@@ -3,11 +3,12 @@ package mesosphere.marathon.api.v2
 import java.net.URI
 import javax.inject.Inject
 import javax.ws.rs._
-import javax.ws.rs.core.{ MediaType, Response }
+import javax.ws.rs.core.Response
 
 import com.codahale.metrics.annotation.Timed
 import mesosphere.marathon.api.v2.json.Formats._
-import mesosphere.marathon.api.{ BeanValidation, ModelValidation, RestResource }
+import mesosphere.marathon.api.v2.json.{ V2Group, V2GroupUpdate }
+import mesosphere.marathon.api.{ MarathonMediaType, RestResource }
 import mesosphere.marathon.state.PathId._
 import mesosphere.marathon.state.{ Group, GroupManager, PathId, Timestamp }
 import mesosphere.marathon.upgrade.DeploymentPlan
@@ -16,7 +17,7 @@ import mesosphere.util.ThreadPoolContext.context
 import play.api.libs.json.Json
 
 @Path("v2/groups")
-@Produces(Array(MediaType.APPLICATION_JSON))
+@Produces(Array(MarathonMediaType.PREFERRED_APPLICATION_JSON))
 class GroupsResource @Inject() (
     groupManager: GroupManager,
     val config: MarathonConf) extends RestResource {
@@ -33,7 +34,7 @@ class GroupsResource @Inject() (
     */
   @GET
   @Timed
-  def root(): Group = result(groupManager.root())
+  def root(): Group = result(groupManager.rootGroup())
 
   /**
     * Get a specific group, optionally with specific version
@@ -55,9 +56,9 @@ class GroupsResource @Inject() (
       case ListRootApps()             => groupResponse(PathId.empty, _.transitiveApps)
       case ListVersionsRE(gid)        => ok(result(groupManager.versions(gid.toRootPath)))
       case ListRootVersionRE()        => ok(result(groupManager.versions(PathId.empty)))
-      case GetVersionRE(gid, version) => groupResponse(gid.toRootPath, identity, version = Some(Timestamp(version)))
-      case GetRootVersionRE(version)  => groupResponse(PathId.empty, identity, version = Some(Timestamp(version)))
-      case _                          => groupResponse(id.toRootPath, identity)
+      case GetVersionRE(gid, version) => groupResponse(gid.toRootPath, V2Group(_), version = Some(Timestamp(version)))
+      case GetRootVersionRE(version)  => groupResponse(PathId.empty, V2Group(_), version = Some(Timestamp(version)))
+      case _                          => groupResponse(id.toRootPath, V2Group(_))
     }
   }
 
@@ -84,10 +85,10 @@ class GroupsResource @Inject() (
   def createWithPath(@PathParam("id") id: String,
                      @DefaultValue("false")@QueryParam("force") force: Boolean,
                      body: Array[Byte]): Response = {
-    val update = Json.parse(body).as[GroupUpdate]
+    val update = Json.parse(body).as[V2GroupUpdate]
     BeanValidation.requireValid(ModelValidation.checkGroupUpdate(update, needsId = true))
     val effectivePath = update.id.map(_.canonicalPath(id.toRootPath)).getOrElse(id.toRootPath)
-    val current = result(groupManager.root(withLatestApps = false)).findGroup(_.id == effectivePath)
+    val current = result(groupManager.rootGroup()).findGroup(_.id == effectivePath)
     if (current.isDefined)
       throw ConflictingChangeException(s"Group $effectivePath is already created. Use PUT to change this group.")
     val (deployment, path, version) = updateOrCreate(id.toRootPath, update, force)
@@ -116,13 +117,13 @@ class GroupsResource @Inject() (
              @DefaultValue("false")@QueryParam("force") force: Boolean,
              @DefaultValue("false")@QueryParam("dryRun") dryRun: Boolean,
              body: Array[Byte]): Response = {
-    val update = Json.parse(body).as[GroupUpdate]
+    val update = Json.parse(body).as[V2GroupUpdate]
     BeanValidation.requireValid(ModelValidation.checkGroupUpdate(update, needsId = false))
     if (dryRun) {
       val planFuture = groupManager.group(id.toRootPath).map { maybeOldGroup =>
         val oldGroup = maybeOldGroup.getOrElse(Group.empty)
         Json.obj(
-          "steps" -> DeploymentPlan(oldGroup, update.apply(oldGroup, Timestamp.now())).steps
+          "steps" -> DeploymentPlan(oldGroup, update.apply(V2Group(oldGroup), Timestamp.now()).toGroup()).steps
         )
       }
 
@@ -166,7 +167,7 @@ class GroupsResource @Inject() (
     }
   }
 
-  private def updateOrCreate(id: PathId, update: GroupUpdate, force: Boolean): (DeploymentPlan, PathId, Timestamp) = {
+  private def updateOrCreate(id: PathId, update: V2GroupUpdate, force: Boolean): (DeploymentPlan, PathId, Timestamp) = {
     val version = Timestamp.now()
     def groupChange(group: Group): Group = {
       val versionChange = update.version.map { updateVersion =>
@@ -176,11 +177,9 @@ class GroupsResource @Inject() (
         )
       }
       val scaleChange = update.scaleBy.map { scale =>
-        group.transitiveApps.foldLeft(group) { (changedGroup, app) =>
-          changedGroup.updateApp(app.id, _.copy(instances = (app.instances * scale).ceil.toInt), version)
-        }
+        group.updateApp(version) { app => app.copy(instances = (app.instances * scale).ceil.toInt) }
       }
-      versionChange orElse scaleChange getOrElse update.apply(group, version)
+      versionChange orElse scaleChange getOrElse update.apply(V2Group(group), version).toGroup()
     }
 
     val effectivePath = update.id.map(_.canonicalPath(id)).getOrElse(id)
